@@ -1,16 +1,37 @@
-#include "ppocr.h"
+#include "ppocr.h" 
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
-#include <windows.h>
+#include <opencv2/core/utility.hpp>
+#include <algorithm>
 #include <filesystem>
 #include <iostream>
 #include <string>
-
+#include <thread>
 #include <chrono>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 int main(int argc, char** argv) {
+#ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
+#endif
+
+    if (argc < 2) {
+        std::cerr << "Usage: " << argv[0]
+                  << " <image> [det_model] [rec_model] [dict_file]\n";
+        return 1;
+    }
+
+    // Cap OpenCV's own internal thread pool so it doesn't oversubscribe the
+    // cores alongside ONNX Runtime's threads (tuned for a quad-core target).
+    const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+    cv::setNumThreads(static_cast<int>(std::min(hw, 4u)));
 
     try {
         std::string image_path = argv[1];
@@ -24,7 +45,7 @@ int main(int argc, char** argv) {
             return 2;
         }
 
-        PP_OCRv6 ocr(det_model, rec_model, dict_file, 4);
+        PP_OCRv6 ocr(det_model, rec_model, dict_file, static_cast<int>(std::min(hw, 4u)));
         
         auto start = std::chrono::steady_clock::now();
 

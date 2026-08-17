@@ -1,11 +1,13 @@
-#include "db_postprocess.h"
+#include "db_postprocess.h" 
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <numeric>
 
 #include <opencv2/imgproc.hpp>
-#include <opencv2/geometry.hpp>
+#include <opencv2/geometry.hpp>  // OpenCV 5: minAreaRect / contourArea live here
+#include <opencv2/core/utility.hpp>
 
 DBPostProcess::DBPostProcess(float thresh, float box_thresh, float unclip_ratio,
                              int max_candidates)
@@ -91,35 +93,52 @@ std::vector<DetBox> DBPostProcess::operator()(const cv::Mat& prob,
     std::vector<std::vector<cv::Point>> contours;
     cv::findContours(bitmap, contours, cv::RETR_LIST, cv::CHAIN_APPROX_SIMPLE);
 
-    std::vector<DetBox> results;
     const int limit = std::min<int>(static_cast<int>(contours.size()), max_candidates_);
-    for (int i = 0; i < limit; ++i) {
-        if (contours[i].size() < 4) continue;
-        float score = box_score_fast(prob, contours[i]);
-        if (score < box_thresh_) continue;
 
-        cv::RotatedRect rr = cv::minAreaRect(contours[i]);
-        cv::Point2f pts4[4];
-        rr.points(pts4);
-        std::vector<cv::Point2f> poly(pts4, pts4 + 4);
-        poly = order_clockwise(poly);
+    // Per-contour work (bounding-rect masking, minAreaRect, unclip offset) is
+    // independent across contours, so it parallelizes cleanly across the
+    // available cores. Each slot is written by exactly one iteration, so no
+    // locking is needed; we compact the "valid" entries afterward.
+    std::vector<DetBox> slots(limit);
+    std::vector<uint8_t> valid(limit, 0);
 
-        double area = std::abs(cv::contourArea(poly));
-        double perimeter = cv::arcLength(poly, true);
-        if (perimeter < 1e-5) continue;
-        float distance = static_cast<float>(area * unclip_ratio_ / perimeter);
-        poly = offset_polygon(poly, distance);
+    cv::parallel_for_(cv::Range(0, limit), [&](const cv::Range& range) {
+        for (int i = range.start; i < range.end; ++i) {
+            if (contours[i].size() < 4) continue;
+            float score = box_score_fast(prob, contours[i]);
+            if (score < box_thresh_) continue;
 
-        for (auto& p : poly) {
-            p.x /= scale_x;
-            p.y /= scale_y;
-            p.x = std::clamp(p.x, 0.0f, static_cast<float>(original_size.width - 1));
-            p.y = std::clamp(p.y, 0.0f, static_cast<float>(original_size.height - 1));
+            cv::RotatedRect rr = cv::minAreaRect(contours[i]);
+            cv::Point2f pts4[4];
+            rr.points(pts4);
+            std::vector<cv::Point2f> poly(pts4, pts4 + 4);
+            poly = order_clockwise(poly);
+
+            double area = std::abs(cv::contourArea(poly));
+            double perimeter = cv::arcLength(poly, true);
+            if (perimeter < 1e-5) continue;
+            float distance = static_cast<float>(area * unclip_ratio_ / perimeter);
+            poly = offset_polygon(poly, distance);
+
+            for (auto& p : poly) {
+                p.x /= scale_x;
+                p.y /= scale_y;
+                p.x = std::clamp(p.x, 0.0f, static_cast<float>(original_size.width - 1));
+                p.y = std::clamp(p.y, 0.0f, static_cast<float>(original_size.height - 1));
+            }
+
+            double area2 = std::abs(cv::contourArea(poly));
+            if (area2 < 4.0) continue;
+
+            slots[i] = DetBox{poly, score};
+            valid[i] = 1;
         }
+    });
 
-        double area2 = std::abs(cv::contourArea(poly));
-        if (area2 < 4.0) continue;
-        results.push_back({poly, score});
+    std::vector<DetBox> results;
+    results.reserve(limit);
+    for (int i = 0; i < limit; ++i) {
+        if (valid[i]) results.push_back(std::move(slots[i]));
     }
 
     std::sort(results.begin(), results.end(), [](const DetBox& a, const DetBox& b) {

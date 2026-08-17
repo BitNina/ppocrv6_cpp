@@ -1,4 +1,4 @@
-#include "ppocr.h"
+#include "ppocr.h" 
 
 #include <algorithm>
 #include <cmath>
@@ -11,7 +11,7 @@
 
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
-#include <opencv2/geometry.hpp>
+#include <opencv2/geometry.hpp>  // OpenCV 5 module for computational geometry
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -20,64 +20,116 @@
 #include <windows.h>
 #endif
 
+namespace {
+
+// ONNX Runtime's Session constructor takes ORTCHAR_T*, which is wchar_t on
+// Windows and char everywhere else. This converts a UTF-8 std::string into
+// whatever that platform expects, so the same source compiles and works on
+// both Windows and Linux.
+#ifdef _WIN32
+std::wstring ToOrtPath(const std::string& s) {
+    if (s.empty()) return {};
+
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
+    if (n <= 0) throw std::runtime_error("MultiByteToWideChar failed for model path.");
+
+    std::wstring w(static_cast<size_t>(n), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), w.data(), n);
+    return w;
+}
+#else
+std::string ToOrtPath(const std::string& s) {
+    return s;  // Linux/macOS: ORTCHAR_T == char, and the filesystem is UTF-8 already.
+}
+#endif
+
+}  // namespace
+
+ThreadPool::ThreadPool(size_t num_threads) {
+    if (num_threads == 0) num_threads = 1;
+    workers_.reserve(num_threads);
+    for (size_t i = 0; i < num_threads; ++i)
+        workers_.emplace_back(&ThreadPool::worker_loop, this);
+}
+
+ThreadPool::~ThreadPool() {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stop_ = true;
+    }
+    cv_tasks_.notify_all();
+    for (auto& w : workers_)
+        if (w.joinable()) w.join();
+}
+
+void ThreadPool::worker_loop() {
+    for (;;) {
+        std::function<void()> job;
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            cv_tasks_.wait(lock, [this] { return stop_ || !tasks_.empty(); });
+            if (stop_ && tasks_.empty()) return;
+            job = std::move(tasks_.front());
+            tasks_.pop();
+        }
+        job();
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            --pending_;
+            if (pending_ == 0) cv_done_.notify_all();
+        }
+    }
+}
+
+void ThreadPool::run_all(const std::vector<std::function<void()>>& jobs) {
+    if (jobs.empty()) return;
+    if (workers_.empty()) {
+        for (auto& j : jobs) j();
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        pending_ = jobs.size();
+        for (auto& j : jobs) tasks_.push(j);
+    }
+    cv_tasks_.notify_all();
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_done_.wait(lock, [this] { return pending_ == 0; });
+    }
+}
+
 PP_OCRv6::PP_OCRv6(const std::string& det_model,
                    const std::string& rec_model,
                    const std::string& dict_file,
                    int threads)
     : env_(ORT_LOGGING_LEVEL_WARNING, "PP-OCRv6"),
-      db_(0.20f, 0.45f, 1.40f, 3000) {
+      db_(0.20f, 0.45f, 1.40f, 3000),
+      rec_pool_(static_cast<size_t>(std::max(1, threads))) {
+    if (threads < 1) threads = 1;
+
     det_options_.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
     rec_options_.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+    // Both sessions run a single graph per call, so there's no benefit to
+    // the parallel executor; sequential mode has lower overhead.
+    det_options_.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
+    rec_options_.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
+    det_options_.SetInterOpNumThreads(1);
+    rec_options_.SetInterOpNumThreads(1);
+
+    // Detection runs once per image, so it gets to use all cores for
+    // intra-op parallelism within that single call.
     det_options_.SetIntraOpNumThreads(threads);
-    rec_options_.SetIntraOpNumThreads(threads);
-    auto utf8_to_wide = [](const std::string& s) -> std::wstring {
-        if (s.empty())
-            return {};
+    // Recognition instead runs once per detected text box, often many times
+    // per image. Instead of parallelizing *inside* each small inference
+    // (high overhead relative to the tiny 48xW crops), we run `threads`
+    // single-threaded recognition calls concurrently via rec_pool_ below.
+    // This keeps total CPU usage matched to the physical core count without
+    // oversubscribing it.
+    rec_options_.SetIntraOpNumThreads(1);
 
-        int n = MultiByteToWideChar(
-            CP_UTF8,
-            0,
-            s.data(),
-            static_cast<int>(s.size()),
-            nullptr,
-            0
-        );
-
-        if (n <= 0)
-            throw std::runtime_error(
-                "MultiByteToWideChar failed for model path."
-            );
-
-        std::wstring w(static_cast<size_t>(n), L'\0');
-
-        MultiByteToWideChar(
-            CP_UTF8,
-            0,
-            s.data(),
-            static_cast<int>(s.size()),
-            w.data(),
-            n
-        );
-
-        return w;
-        };
-
-    const std::wstring det_model_w = utf8_to_wide(det_model);
-    const std::wstring rec_model_w = utf8_to_wide(rec_model);
-
-    det_session_ =
-        Ort::Session(
-            env_,
-            det_model_w.c_str(),
-            det_options_
-        );
-
-    rec_session_ =
-        Ort::Session(
-            env_,
-            rec_model_w.c_str(),
-            rec_options_
-        );
+    det_session_ = Ort::Session(env_, ToOrtPath(det_model).c_str(), det_options_);
+    rec_session_ = Ort::Session(env_, ToOrtPath(rec_model).c_str(), rec_options_);
 
     auto det_inputs = get_node_names(det_session_, true);
     auto rec_inputs = get_node_names(rec_session_, true);
@@ -248,13 +300,13 @@ std::vector<DetBox> PP_OCRv6::detect(const cv::Mat& image) {
     cv::Mat resized = resize_det(image, sx, sy);
     std::vector<float> input = normalize_chw(resized);
 
-    int64_t shape[4] = {1, 3, resized.rows, resized.cols};
+    int64_t shape[4] = { 1, 3, resized.rows, resized.cols };
     Ort::MemoryInfo mem = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
     Ort::Value tensor = Ort::Value::CreateTensor<float>(mem, input.data(), input.size(), shape, 4);
 
-    const char* in_names[] = {det_input_name_.c_str()};
-    const char* out_names[] = {det_output_name_.c_str()};
-    auto outputs = det_session_.Run(Ort::RunOptions{nullptr}, in_names, &tensor, 1, out_names, 1);
+    const char* in_names[] = { det_input_name_.c_str() };
+    const char* out_names[] = { det_output_name_.c_str() };
+    auto outputs = det_session_.Run(Ort::RunOptions{ nullptr }, in_names, &tensor, 1, out_names, 1);
     auto shape_out = tensor_shape(outputs.front());
     auto data = sigmoid_if_needed(tensor_to_vector(outputs.front()));
 
@@ -262,10 +314,12 @@ std::vector<DetBox> PP_OCRv6::detect(const cv::Mat& image) {
     if (shape_out.size() == 4) {
         H = static_cast<int>(shape_out[2]);
         W = static_cast<int>(shape_out[3]);
-    } else if (shape_out.size() == 3) {
+    }
+    else if (shape_out.size() == 3) {
         H = static_cast<int>(shape_out[1]);
         W = static_cast<int>(shape_out[2]);
-    } else {
+    }
+    else {
         throw std::runtime_error("Unexpected detection output rank.");
     }
     if (static_cast<size_t>(H) * W != data.size()) {
@@ -273,36 +327,41 @@ std::vector<DetBox> PP_OCRv6::detect(const cv::Mat& image) {
     }
 
     cv::Mat prob(H, W, CV_32FC1, data.data());
-    return db_(prob, static_cast<float>(W) / resized.cols,
-               static_cast<float>(H) / resized.rows, image.size());
+    auto boxes = db_(prob, static_cast<float>(W) / resized.cols,
+        static_cast<float>(H) / resized.rows, image.size());
+
+    // ===== 关键修复：把坐标从 resized 空间还原到原图空间 =====
+    for (auto& box : boxes) {
+        for (auto& p : box.points) {
+            p.x /= sx;
+            p.y /= sy;
+        }
+    }
+    // =========================================================
+
+    return boxes;
 }
 
 cv::Mat PP_OCRv6::four_point_crop(const cv::Mat& image, const std::vector<cv::Point2f>& box) {
     CV_Assert(box.size() == 4);
-    std::vector<cv::Point2f> pts = box;
-    // order_clockwise-like deterministic order from centroid
-    cv::Point2f c(0,0); for (auto p : pts) c += p; c *= 0.25f;
-    std::sort(pts.begin(), pts.end(), [&](auto a, auto b) {
-        return std::atan2(a.y-c.y, a.x-c.x) < std::atan2(b.y-c.y, b.x-c.x);
-    });
+    std::vector<cv::Point2f> pts = box;   // db_postprocess 已保证顺时针，直接复用
 
-    auto dist = [](cv::Point2f a, cv::Point2f b) { return cv::norm(a-b); };
+    auto dist = [](cv::Point2f a, cv::Point2f b) { return cv::norm(a - b); };
     float w1 = dist(pts[0], pts[1]);
     float w2 = dist(pts[2], pts[3]);
     float h1 = dist(pts[0], pts[3]);
     float h2 = dist(pts[1], pts[2]);
-    int w = std::max(1, static_cast<int>(std::round(std::max(w1,w2))));
-    int h = std::max(1, static_cast<int>(std::round(std::max(h1,h2))));
-    std::vector<cv::Point2f> dst{{0,0}, {static_cast<float>(w-1),0},
-                                 {static_cast<float>(w-1), static_cast<float>(h-1)},
-                                 {0, static_cast<float>(h-1)}};
-    return [&] {
-        cv::Mat M = cv::getPerspectiveTransform(pts, dst);
-        cv::Mat crop;
-        cv::warpPerspective(image, crop, M, cv::Size(w,h), cv::INTER_CUBIC,
-                            cv::BORDER_REPLICATE);
-        return crop;
-    }();
+    int w = std::max(1, static_cast<int>(std::round(std::max(w1, w2))));
+    int h = std::max(1, static_cast<int>(std::round(std::max(h1, h2))));
+    std::vector<cv::Point2f> dst{ {0,0}, {static_cast<float>(w - 1),0},
+                                 {static_cast<float>(w - 1), static_cast<float>(h - 1)},
+                                 {0, static_cast<float>(h - 1)} };
+
+    cv::Mat M = cv::getPerspectiveTransform(pts, dst);
+    cv::Mat crop;
+    cv::warpPerspective(image, crop, M, cv::Size(w, h), cv::INTER_CUBIC,
+        cv::BORDER_REPLICATE);
+    return crop;
 }
 
 std::pair<std::string, float> PP_OCRv6::recognize(const cv::Mat& crop) {
@@ -392,12 +451,37 @@ std::pair<std::string, float> PP_OCRv6::recognize(const cv::Mat& crop) {
 std::vector<OCRResult> PP_OCRv6::run(const cv::Mat& image) {
     if (image.empty()) throw std::runtime_error("Input image is empty.");
     auto boxes = detect(image);
+    if (boxes.empty()) return {};
+
+    // Cropping is cheap (warpPerspective on small regions); do it up front
+    // so the thread pool jobs below are pure inference work.
+    std::vector<cv::Mat> crops(boxes.size());
+    for (size_t i = 0; i < boxes.size(); ++i)
+        crops[i] = four_point_crop(image, boxes[i].points);
+
+    // Recognition is independent per box (rec_session_ is configured with a
+    // single intra-op thread, see the constructor), so fan it out across
+    // the pool: this is where multi-core speedup actually shows up on
+    // images with several text lines.
+    std::vector<std::string> texts(boxes.size());
+    std::vector<float> scores(boxes.size(), 0.0f);
+
+    std::vector<std::function<void()>> jobs;
+    jobs.reserve(boxes.size());
+    for (size_t i = 0; i < boxes.size(); ++i) {
+        jobs.emplace_back([this, &crops, &texts, &scores, i] {
+            auto [text, rec_score] = recognize(crops[i]);
+            texts[i] = std::move(text);
+            scores[i] = rec_score;
+        });
+    }
+    rec_pool_.run_all(jobs);
+
     std::vector<OCRResult> results;
     results.reserve(boxes.size());
-    for (const auto& b : boxes) {
-        cv::Mat crop = four_point_crop(image, b.points);
-        auto [text, rec_score] = recognize(crop);
-        if (!text.empty()) results.push_back({text, rec_score, b.points});
+    for (size_t i = 0; i < boxes.size(); ++i) {
+        if (!texts[i].empty())
+            results.push_back({std::move(texts[i]), scores[i], boxes[i].points});
     }
     return results;
 }
