@@ -300,13 +300,13 @@ std::vector<DetBox> PP_OCRv6::detect(const cv::Mat& image) {
     cv::Mat resized = resize_det(image, sx, sy);
     std::vector<float> input = normalize_chw(resized);
 
-    int64_t shape[4] = {1, 3, resized.rows, resized.cols};
+    int64_t shape[4] = { 1, 3, resized.rows, resized.cols };
     Ort::MemoryInfo mem = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
     Ort::Value tensor = Ort::Value::CreateTensor<float>(mem, input.data(), input.size(), shape, 4);
 
-    const char* in_names[] = {det_input_name_.c_str()};
-    const char* out_names[] = {det_output_name_.c_str()};
-    auto outputs = det_session_.Run(Ort::RunOptions{nullptr}, in_names, &tensor, 1, out_names, 1);
+    const char* in_names[] = { det_input_name_.c_str() };
+    const char* out_names[] = { det_output_name_.c_str() };
+    auto outputs = det_session_.Run(Ort::RunOptions{ nullptr }, in_names, &tensor, 1, out_names, 1);
     auto shape_out = tensor_shape(outputs.front());
     auto data = sigmoid_if_needed(tensor_to_vector(outputs.front()));
 
@@ -314,10 +314,12 @@ std::vector<DetBox> PP_OCRv6::detect(const cv::Mat& image) {
     if (shape_out.size() == 4) {
         H = static_cast<int>(shape_out[2]);
         W = static_cast<int>(shape_out[3]);
-    } else if (shape_out.size() == 3) {
+    }
+    else if (shape_out.size() == 3) {
         H = static_cast<int>(shape_out[1]);
         W = static_cast<int>(shape_out[2]);
-    } else {
+    }
+    else {
         throw std::runtime_error("Unexpected detection output rank.");
     }
     if (static_cast<size_t>(H) * W != data.size()) {
@@ -325,36 +327,41 @@ std::vector<DetBox> PP_OCRv6::detect(const cv::Mat& image) {
     }
 
     cv::Mat prob(H, W, CV_32FC1, data.data());
-    return db_(prob, static_cast<float>(W) / resized.cols,
-               static_cast<float>(H) / resized.rows, image.size());
+    auto boxes = db_(prob, static_cast<float>(W) / resized.cols,
+        static_cast<float>(H) / resized.rows, image.size());
+
+    // ===== 关键修复：把坐标从 resized 空间还原到原图空间 =====
+    for (auto& box : boxes) {
+        for (auto& p : box.points) {
+            p.x /= sx;
+            p.y /= sy;
+        }
+    }
+    // =========================================================
+
+    return boxes;
 }
 
 cv::Mat PP_OCRv6::four_point_crop(const cv::Mat& image, const std::vector<cv::Point2f>& box) {
     CV_Assert(box.size() == 4);
-    std::vector<cv::Point2f> pts = box;
-    // order_clockwise-like deterministic order from centroid
-    cv::Point2f c(0,0); for (auto p : pts) c += p; c *= 0.25f;
-    std::sort(pts.begin(), pts.end(), [&](auto a, auto b) {
-        return std::atan2(a.y-c.y, a.x-c.x) < std::atan2(b.y-c.y, b.x-c.x);
-    });
+    std::vector<cv::Point2f> pts = box;   // db_postprocess 已保证顺时针，直接复用
 
-    auto dist = [](cv::Point2f a, cv::Point2f b) { return cv::norm(a-b); };
+    auto dist = [](cv::Point2f a, cv::Point2f b) { return cv::norm(a - b); };
     float w1 = dist(pts[0], pts[1]);
     float w2 = dist(pts[2], pts[3]);
     float h1 = dist(pts[0], pts[3]);
     float h2 = dist(pts[1], pts[2]);
-    int w = std::max(1, static_cast<int>(std::round(std::max(w1,w2))));
-    int h = std::max(1, static_cast<int>(std::round(std::max(h1,h2))));
-    std::vector<cv::Point2f> dst{{0,0}, {static_cast<float>(w-1),0},
-                                 {static_cast<float>(w-1), static_cast<float>(h-1)},
-                                 {0, static_cast<float>(h-1)}};
-    return [&] {
-        cv::Mat M = cv::getPerspectiveTransform(pts, dst);
-        cv::Mat crop;
-        cv::warpPerspective(image, crop, M, cv::Size(w,h), cv::INTER_CUBIC,
-                            cv::BORDER_REPLICATE);
-        return crop;
-    }();
+    int w = std::max(1, static_cast<int>(std::round(std::max(w1, w2))));
+    int h = std::max(1, static_cast<int>(std::round(std::max(h1, h2))));
+    std::vector<cv::Point2f> dst{ {0,0}, {static_cast<float>(w - 1),0},
+                                 {static_cast<float>(w - 1), static_cast<float>(h - 1)},
+                                 {0, static_cast<float>(h - 1)} };
+
+    cv::Mat M = cv::getPerspectiveTransform(pts, dst);
+    cv::Mat crop;
+    cv::warpPerspective(image, crop, M, cv::Size(w, h), cv::INTER_CUBIC,
+        cv::BORDER_REPLICATE);
+    return crop;
 }
 
 std::pair<std::string, float> PP_OCRv6::recognize(const cv::Mat& crop) {
