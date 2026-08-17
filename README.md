@@ -27,7 +27,9 @@ image
 - Visual Studio 2026，Desktop development with C++
 - CMake >= 3.20
 - OpenCV 5.x
+-- https://github.com/opencv/opencv/releases/download/5.0.0/opencv-5.0.0-windows.exe
 - ONNX Runtime 1.x CPU package
+-- https://github.com/microsoft/onnxruntime/releases/download/v1.29.0/onnxruntime-win-x64-1.29.0.zip
 
 
 
