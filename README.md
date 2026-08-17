@@ -19,53 +19,22 @@ image
 
 - `PP-OCRv6_small_det_onnx/inference.onnx`
 - `PP-OCRv6_small_rec_onnx/inference.onnx`
-- `ppocrv6_dict.txt`
-
-下载：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\download_models.ps1
-```
-
-注意：ONNX 模型不随源码压缩包重复打包，脚本会从官方仓库下载。
 
 ## 2. Windows 依赖
 
 需要：
 
-- Visual Studio 2022，Desktop development with C++
+- Visual Studio 2026，Desktop development with C++
 - CMake >= 3.20
-- OpenCV 4.x
+- OpenCV 5.x
 - ONNX Runtime 1.x CPU package
 
-目录可以类似：
 
-```text
-D:\libs\onnxruntime-win-x64-1.xx.x\
-  include\onnxruntime_cxx_api.h
-  lib\onnxruntime.lib
-  lib\onnxruntime.dll
-
-D:\libs\opencv\build\
-  OpenCVConfig.cmake
-```
-
-设置环境变量：
-
-```powershell
-$env:ONNXRUNTIME_ROOT="D:\libs\onnxruntime-win-x64-1.xx.x"
-```
-
-然后让 CMake 找到 OpenCV，例如：
-
-```powershell
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
-  -DOpenCV_DIR="D:\libs\opencv\build"
-```
 
 构建：
-
+在CMakeLists.txt中设置ONNXRUNTIME_ROOT和OpenCV_DIR路径
 ```powershell
+cmake -S . -B build -G "Visual Studio 18 2026" -A x64
 cmake --build build --config Release
 ```
 
@@ -127,17 +96,7 @@ Recognition：
 
 ## 5. CUDA
 
-默认是 CPU。
-
-如果你安装的是 ONNX Runtime GPU 包，可以：
-
-```powershell
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
-  -DOpenCV_DIR="D:\libs\opencv\build" `
-  -DUSE_CUDA=ON
-```
-
-然后确保 ONNX Runtime GPU 对应的 CUDA/cuDNN DLL 能被 Windows 找到。
+不准备支持
 
 ## 6. 代码结构
 
@@ -145,7 +104,6 @@ cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
 ppocrv6_cpp/
 ├─ CMakeLists.txt
 ├─ README.md
-├─ download_models.ps1
 ├─ include/
 │  ├─ db_postprocess.h
 │  └─ ppocr.h
